@@ -1,113 +1,116 @@
 """
 Today I Learned Example: AWS IAM Least Privilege Policies
-Date: 2026-10-23
+Date: 2026-10-27
 """
 
-# AWS IAM Least Privilege Policy Generator and Analyzer
-# This script demonstrates the principle of least privilege for AWS IAM policies.
-# Least privilege means granting ONLY the permissions required to perform a task,
-# nothing more. This minimizes the attack surface if credentials are compromised.
+# AWS IAM Least Privilege Policies - Educational Demonstration
+# This script demonstrates the concept of least privilege in AWS IAM policies
+# using Python's standard library to simulate policy evaluation and generation.
 #
-# WHEN TO USE:
-# - When creating IAM roles for Lambda functions, EC2 instances, or services
-# - When onboarding new users or teams who need limited AWS access
-# - When auditing existing policies for over-permissive access
-# - As part of a security review or compliance process
+# WHAT IS LEAST PRIVILEGE?
+# The principle of least privilege means granting only the minimum permissions
+# required for a user/service to perform their specific tasks - nothing more.
+#
+# WHEN TO USE IT:
+# - Always. Every IAM user, role, and service should follow this principle.
+# - Especially critical for production environments and sensitive data access.
 #
 # BEST PRACTICES:
-# 1. Start with zero permissions, add only what is needed
-# 2. Use specific resource ARNs instead of wildcards ("*")
-# 3. Prefer managed policies for common use cases, inline for specificity
-# 4. Regularly audit and rotate/remove unused permissions
-# 5. Use conditions (IP, MFA, time) to further restrict access
+# - Start with zero permissions, add only what's needed
+# - Avoid wildcard (*) actions and resources where possible
+# - Use conditions to further restrict access (time, IP, MFA, etc.)
+# - Regularly audit and remove unused permissions
 
 import json
-import copy
+from datetime import datetime
 
-# --- Define overly permissive (BAD) policy examples ---
-BAD_POLICY = {
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Action": "*",           # Wildcard action = full admin access (DANGER)
-            "Resource": "*"          # Wildcard resource = applies to everything (DANGER)
-        }
-    ]
-}
+def create_least_privilege_policy(service, actions, resources, conditions=None):
+    """
+    Generates a minimal IAM policy document.
+    Only grants specific actions on specific resources - no wildcards.
+    """
+    statement = {
+        "Effect": "Allow",
+        "Action": actions,       # Specific actions only (e.g., "s3:GetObject")
+        "Resource": resources,   # Specific ARNs, not "*"
+    }
+    if conditions:
+        statement["Condition"] = conditions  # Extra guardrails
 
-# --- Define a least-privilege (GOOD) policy for a Lambda reading from one S3 bucket ---
-GOOD_POLICY = {
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Sid": "AllowS3ReadOnSpecificBucket",
-            "Effect": "Allow",
-            "Action": [
-                "s3:GetObject",      # Only read objects
-                "s3:ListBucket"      # Only list objects in the bucket
-            ],
-            "Resource": [
-                "arn:aws:s3:::my-app-data-bucket",        # The bucket itself
-                "arn:aws:s3:::my-app-data-bucket/*"       # Objects inside the bucket
-            ],
-            "Condition": {
-                "StringEquals": {
-                    "aws:RequestedRegion": "us-east-1"    # Restrict to one region
-                }
-            }
-        },
-        {
-            "Sid": "AllowCloudWatchLogging",
-            "Effect": "Allow",
-            "Action": [
-                "logs:CreateLogGroup",
-                "logs:CreateLogStream",
-                "logs:PutLogEvents"   # Only log writing, no deletion or reading others' logs
-            ],
-            "Resource": "arn:aws:logs:us-east-1:123456789012:log-group:/aws/lambda/my-function:*"
-        }
-    ]
-}
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [statement]
+    }
+    return policy
 
-def analyze_policy(policy: dict, name: str) -> dict:
-    """Analyze an IAM policy and flag potential over-permissive statements."""
-    findings = []
+def evaluate_policy_risk(policy):
+    """
+    Analyzes an IAM policy for common least-privilege violations.
+    Returns a risk report highlighting dangerous configurations.
+    """
+    risks = []
     for stmt in policy.get("Statement", []):
         actions = stmt.get("Action", [])
         resources = stmt.get("Resource", [])
-        # Normalize to lists for uniform processing
-        if isinstance(actions, str):
-            actions = [actions]
-        if isinstance(resources, str):
-            resources = [resources]
+        conditions = stmt.get("Condition", {})
 
-        if "*" in actions:
-            findings.append("CRITICAL: Wildcard action '*' grants full access.")
-        if "*" in resources:
-            findings.append("WARNING: Wildcard resource '*' applies to ALL resources.")
-        if stmt.get("Effect") == "Allow" and not stmt.get("Condition"):
-            findings.append("INFO: No Condition block — consider adding IP or MFA constraints.")
+        # RISK: Wildcard action grants ALL permissions on a service or globally
+        if "*" in actions or any("*" in a for a in actions):
+            risks.append("HIGH: Wildcard action (*) detected - violates least privilege")
 
-    return {"policy_name": name, "findings": findings, "total_issues": len(findings)}
+        # RISK: Wildcard resource means the action applies to ALL resources
+        if resources == "*" or resources == ["*"]:
+            risks.append("HIGH: Wildcard resource (*) - scope is too broad")
 
-def remediate_policy(policy: dict) -> dict:
-    """Demonstrate auto-remediation: replace wildcard actions with a safe placeholder."""
-    remediated = copy.deepcopy(policy)
-    for stmt in remediated.get("Statement", []):
-        if stmt.get("Action") == "*":
-            # Replace with a read-only placeholder — in real use, specify exact actions
-            stmt["Action"] = ["<REPLACE_WITH_SPECIFIC_ACTIONS>"]
-            stmt["Resource"] = ["<REPLACE_WITH_SPECIFIC_RESOURCE_ARN>"]
-    return remediated
+        # RISK: Admin-level actions should almost never be granted
+        admin_actions = {"iam:*", "sts:AssumeRole", "*"}
+        if any(a in admin_actions for a in (actions if isinstance(actions, list) else [actions])):
+            risks.append("CRITICAL: Admin-level action detected - review immediately")
 
-# --- Run the analysis ---
+        # BEST PRACTICE: Conditions add extra security context (MFA, IP, time)
+        if not conditions:
+            risks.append("INFO: No conditions set - consider adding MFA or IP restrictions")
+
+    return risks if risks else ["PASS: Policy appears to follow least privilege principles"]
+
+# --- DEMONSTRATION ---
+
 print("=" * 60)
-print("IAM Least Privilege Policy Analyzer")
+print("IAM Least Privilege Policy Demonstration")
+print(f"Generated at: {datetime.utcnow().isoformat()}Z")
 print("=" * 60)
 
-for policy, label in [(BAD_POLICY, "BAD (Over-permissive)"), (GOOD_POLICY, "GOOD (Least Privilege)")]:
-    result = analyze_policy(policy, label)
-    print(f"\nPolicy: {result['policy_name']}")
-    print(f"Issues Found: {result['total_issues']}")
-    for finding in result["
+# GOOD EXAMPLE: Specific S3 read-only access to one bucket prefix
+good_policy = create_least_privilege_policy(
+    service="s3",
+    actions=["s3:GetObject", "s3:ListBucket"],          # Only what's needed
+    resources=[
+        "arn:aws:s3:::my-app-bucket",
+        "arn:aws:s3:::my-app-bucket/reports/*"          # Scoped to a prefix
+    ],
+    conditions={"Bool": {"aws:MultiFactorAuthPresent": "true"}}  # Require MFA
+)
+
+print("\n[GOOD POLICY - Read-only S3 access with MFA condition]")
+print(json.dumps(good_policy, indent=2))
+print("\nRisk Evaluation:", evaluate_policy_risk(good_policy))
+
+# BAD EXAMPLE: Overly permissive policy (common mistake)
+bad_policy = {
+    "Version": "2012-10-17",
+    "Statement": [{
+        "Effect": "Allow",
+        "Action": "*",        # NEVER do this - grants all AWS actions
+        "Resource": "*"       # On all resources - effectively full admin access
+    }]
+}
+
+print("\n[BAD POLICY - Overly permissive (admin access)]")
+print(json.dumps(bad_policy, indent=2))
+print("\nRisk Evaluation:", evaluate_policy_risk(bad_policy))
+
+print("\n[KEY TAKEAWAYS]")
+takeaways = [
+    "1. Always specify exact actions needed (e.g., s3:GetObject, not s3:*)",
+    "2. Always scope resources to specific ARNs, never use bare '*'",
+    "3. Add
