@@ -1,107 +1,104 @@
 """
 Today I Learned Example: Reverse Proxy Header Hardening (X-Forwarded-For)
-Date: 2026-10-29
+Date: 2026-11-01
 """
 
 # Reverse Proxy Header Hardening (X-Forwarded-For)
 #
 # WHAT THIS PATTERN DOES:
-# When your application sits behind a reverse proxy (nginx, AWS ALB, Cloudflare, etc.),
-# the client's real IP address is passed via the X-Forwarded-For (XFF) header.
-# Format: X-Forwarded-For: client, proxy1, proxy2
+# When your app sits behind a reverse proxy (Nginx, AWS ALB, Cloudflare, etc.),
+# the real client IP is passed via the X-Forwarded-For (XFF) header.
+# Format: "client, proxy1, proxy2" (leftmost = original client)
 #
 # WHY IT MATTERS:
-# If you blindly trust X-Forwarded-For, attackers can spoof their IP address by
-# sending: X-Forwarded-For: 127.0.0.1, attacker_controlled_value
-# This breaks IP-based rate limiting, geo-blocking, and audit logging.
+# Attackers can SPOOF X-Forwarded-For by sending their own header value.
+# If your app naively trusts XFF, an attacker can fake their IP to bypass
+# rate limiting, geo-restrictions, or audit logging.
 #
-# THE FIX:
-# Only trust a known number of proxy hops from the RIGHT side of the header.
-# Your infrastructure controls the rightmost entries; clients control the leftmost.
+# THE SAFE APPROACH:
+# Only trust N rightmost IPs added by YOUR known/trusted proxies.
+# The rightmost IP is always added by the last proxy your server talked to
+# directly — that one cannot be spoofed by the client.
 #
 # BEST PRACTICES:
-# 1. Set TRUSTED_PROXY_COUNT to exactly how many proxies sit in front of your app.
-# 2. Never trust the full header chain blindly.
-# 3. Validate extracted IPs — reject malformed values.
-# 4. If no proxy sits in front, use REMOTE_ADDR directly and ignore XFF entirely.
+# 1. Configure exactly how many trusted proxies sit in front of your app.
+# 2. Strip/ignore client-supplied XFF entries beyond that count.
+# 3. Validate extracted IPs are well-formed.
+# 4. Never trust XFF at all if you have no proxies.
 
 import ipaddress
-import re
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# How many reverse proxies sit in front of this application.
-# Set this to match your actual infrastructure (e.g., 1 for a single nginx).
+
+# Number of trusted reverse proxies in front of this application.
+# Example: 1 if you have one Nginx instance, 2 if Nginx + a load balancer.
 TRUSTED_PROXY_COUNT = 1
 
-# Simple regex for basic IP format sanity check before full parsing
-_IP_RE = re.compile(r'^[\d\.a-fA-F:]+$')
 
-
-def get_real_client_ip(xff_header: str | None, remote_addr: str) -> str:
+def extract_real_client_ip(xff_header: str, remote_addr: str, trusted_proxies: int) -> str:
     """
-    Extract the real client IP from X-Forwarded-For using a fixed proxy count.
+    Safely extract the real client IP from X-Forwarded-For.
 
     Args:
-        xff_header:  Value of the X-Forwarded-For header (may be None or spoofed).
-        remote_addr: The direct TCP connection IP (REMOTE_ADDR) — always trustworthy.
+        xff_header:      Raw value of the X-Forwarded-For header (may be empty).
+        remote_addr:     The TCP-level peer address (always trustworthy — OS-provided).
+        trusted_proxies: How many proxies you control and trust.
 
     Returns:
-        A validated IP string, or remote_addr as a safe fallback.
+        A validated IP string representing the real client.
     """
-    # If no proxies are configured, ignore XFF entirely — use the direct connection IP.
-    if TRUSTED_PROXY_COUNT == 0 or not xff_header:
+    if trusted_proxies == 0 or not xff_header:
+        # No proxies configured, or no header present — use the direct TCP peer.
         return remote_addr
 
-    # Split the header into individual hops and strip whitespace.
-    # Example: "1.2.3.4, 10.0.0.1, 172.16.0.1"  →  ["1.2.3.4", "10.0.0.1", "172.16.0.1"]
-    hops = [h.strip() for h in xff_header.split(',')]
+    # Split the XFF chain and strip whitespace from each entry.
+    # Example: "1.2.3.4, 10.0.0.1, 10.0.0.2" → ["1.2.3.4", "10.0.0.1", "10.0.0.2"]
+    ip_chain = [ip.strip() for ip in xff_header.split(",")]
 
-    # The rightmost N entries were added by our trusted proxies.
-    # The entry just to the LEFT of those is the real client IP.
-    # Index calculation: -(TRUSTED_PROXY_COUNT + 1) from the right.
-    target_index = -(TRUSTED_PROXY_COUNT + 1)
+    # The rightmost `trusted_proxies` entries were added by our own infrastructure.
+    # Everything to the LEFT of those is either the real client or attacker-controlled.
+    # We want the entry just to the left of our trusted proxy additions.
+    #
+    # Safe index: len(chain) - trusted_proxies - 1
+    # If the chain is too short (attacker didn't send enough hops), fall back to remote_addr.
+    safe_index = len(ip_chain) - trusted_proxies - 1
 
-    if len(hops) < TRUSTED_PROXY_COUNT + 1:
-        # Not enough hops — header may be missing entries; fall back to REMOTE_ADDR.
+    if safe_index < 0:
+        # Chain is shorter than expected — the header may be missing entries.
+        # Fall back to the direct peer address to avoid trusting spoofed data.
         return remote_addr
 
-    candidate = hops[target_index]
+    candidate_ip = ip_chain[safe_index]
 
-    # Validate the candidate looks like an IP address before using it.
-    if not _IP_RE.match(candidate):
-        return remote_addr  # Reject garbage values
-
+    # Validate the extracted value is actually a valid IP address.
     try:
-        # ipaddress.ip_address() strictly validates IPv4 and IPv6 format.
-        validated = str(ipaddress.ip_address(candidate))
-        return validated
+        ipaddress.ip_address(candidate_ip)
+        return candidate_ip
     except ValueError:
-        # Malformed value — fall back to the safe direct-connection IP.
+        # Malformed IP in the header — fall back to safe peer address.
         return remote_addr
 
 
 class HardenedHandler(BaseHTTPRequestHandler):
-    """Minimal HTTP handler that demonstrates hardened IP extraction."""
+    """Simple HTTP handler demonstrating hardened XFF extraction."""
 
     def do_GET(self):
-        xff = self.headers.get('X-Forwarded-For')
+        xff = self.headers.get("X-Forwarded-For", "")
+        # self.client_address[0] is the OS-level TCP peer (e.g., your Nginx IP).
         remote_addr = self.client_address[0]
 
-        real_ip = get_real_client_ip(xff, remote_addr)
+        real_ip = extract_real_client_ip(xff, remote_addr, TRUSTED_PROXY_COUNT)
 
-        response = (
-            f"REMOTE_ADDR      : {remote_addr}\n"
-            f"X-Forwarded-For  : {xff or '(not set)'}\n"
-            f"Resolved Real IP : {real_ip}\n"
-            f"Trusted Proxies  : {TRUSTED_PROXY_COUNT}\n"
-        )
         self.send_response(200)
-        self.send_header('Content-Type', 'text/plain')
+        self.send_header("Content-Type", "text/plain")
         self.end_headers()
+        response = (
+            f"TCP peer (remote_addr): {remote_addr}\n"
+            f"X-Forwarded-For header: {xff or '(none)'}\n"
+            f"Resolved real client IP: {real_ip}\n"
+            f"Trusted proxy count:     {TRUSTED_PROXY_COUNT}\n"
+        )
         self.wfile.write(response.encode())
 
-    def log_message(self, fmt, *args):  # Suppress default access log noise
-        pass
-
-
-if __name
+    def log_message(self, fmt, *args):
+        # Suppress default server log noise for cleaner demo output
