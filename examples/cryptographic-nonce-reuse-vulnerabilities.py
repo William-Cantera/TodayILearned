@@ -1,36 +1,35 @@
 """
 Today I Learned Example: Cryptographic Nonce Reuse Vulnerabilities
-Date: 2026-11-10
+Date: 2026-11-13
 """
 
 # Cryptographic Nonce Reuse Vulnerabilities
 # This script demonstrates why reusing a nonce (number used once) in stream ciphers
-# is catastrophically dangerous. We simulate a simplified XOR stream cipher to show
-# how an attacker can recover plaintexts when the same keystream is used twice.
+# is catastrophic. We simulate a simplified XOR-based stream cipher (similar to how
+# CTR mode or OTP works) to show how nonce reuse leaks plaintext.
 #
-# WHEN THIS MATTERS: Any stream cipher (RC4, CTR mode AES, ChaCha20, OTP) becomes
-# completely broken when the same key+nonce combination encrypts two messages.
+# WHEN THIS MATTERS: Any stream cipher (AES-CTR, ChaCha20, RC4, OTP) where the same
+# keystream must NEVER be used twice. Nonce reuse allows an attacker to XOR two
+# ciphertexts together and cancel out the key, recovering plaintext relationships.
 #
-# BEST PRACTICE: Always use a fresh, random nonce for each encryption operation.
+# BEST PRACTICES:
+# - Use a random nonce for every encryption operation
+# - Use authenticated encryption (AES-GCM) which detects tampering
+# - Never reuse a (key, nonce) pair under any circumstances
+# - Prefer nonce-misuse resistant schemes (AES-SIV) for critical systems
 
 import os
-import secrets
+import hashlib
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def generate_keystream(key: bytes, nonce: bytes, length: int) -> bytes:
-    """
-    Simulate a stream cipher keystream using a simple PRNG seeded by key+nonce.
-    In real life this would be ChaCha20 or AES-CTR; the vulnerability is the same.
-    WARNING: This PRNG is NOT cryptographically secure – for demo purposes only.
-    """
-    import hashlib
-    seed = key + nonce
+    """Derive a deterministic keystream from key+nonce using SHA-256 in a simple
+    counter mode. In real ciphers this is done by AES or ChaCha20 internals."""
     stream = b""
     counter = 0
     while len(stream) < length:
-        # Derive pseudo-random bytes by hashing seed + counter block
-        block = hashlib.sha256(seed + counter.to_bytes(4, "big")).digest()
+        block = hashlib.sha256(key + nonce + counter.to_bytes(4, "big")).digest()
         stream += block
         counter += 1
     return stream[:length]
@@ -40,56 +39,51 @@ def xor_bytes(a: bytes, b: bytes) -> bytes:
     return bytes(x ^ y for x, y in zip(a, b))
 
 def encrypt(plaintext: bytes, key: bytes, nonce: bytes) -> bytes:
-    """Encrypt plaintext using the simulated stream cipher."""
+    """Stream-cipher encryption: ciphertext = plaintext XOR keystream."""
     keystream = generate_keystream(key, nonce, len(plaintext))
     return xor_bytes(plaintext, keystream)
 
-# ── Vulnerability Demo ────────────────────────────────────────────────────────
+# decrypt is identical to encrypt for XOR stream ciphers
+decrypt = encrypt
+
+# ── Demonstration ─────────────────────────────────────────────────────────────
 
 print("=" * 60)
-print("DEMO 1: Nonce REUSE – catastrophic key-stream exposure")
+print("  NONCE REUSE VULNERABILITY DEMONSTRATION")
 print("=" * 60)
 
-# Alice and Bob share a secret key
-SECRET_KEY = secrets.token_bytes(32)
+# The secret key — never known to the attacker
+key = os.urandom(32)
 
-# !! BUG: The same nonce is reused for two different messages !!
-REUSED_NONCE = b"\x00" * 12   # A common mistake: hardcoded or zeroed nonce
+# ── VULNERABLE: same nonce used for two messages ──────────────────────────────
+REUSED_NONCE = b"fixed_nonce_1234"   # <-- BUG: hardcoded / reused nonce
 
-message_A = b"Attack at dawn!!"
-message_B = b"Retreat to base!"
+message1 = b"TRANSFER $10000 TO ACCOUNT 99887766"
+message2 = b"LAUNCH MISSILES AT DAWN COORDINATES"
 
-cipher_A = encrypt(message_A, SECRET_KEY, REUSED_NONCE)
-cipher_B = encrypt(message_B, SECRET_KEY, REUSED_NONCE)
+ct1 = encrypt(message1, key, REUSED_NONCE)
+ct2 = encrypt(message2, key, REUSED_NONCE)
 
-print(f"Ciphertext A : {cipher_A.hex()}")
-print(f"Ciphertext B : {cipher_B.hex()}")
+print("\n[VULNERABLE] Both messages encrypted with the SAME nonce.")
+print(f"  Ciphertext 1 (hex): {ct1.hex()}")
+print(f"  Ciphertext 2 (hex): {ct2.hex()}")
 
-# ── Attack: XOR the two ciphertexts ──────────────────────────────────────────
-# Because: C_A = P_A XOR K  and  C_B = P_B XOR K
-# Therefore: C_A XOR C_B = P_A XOR P_B  (keystream cancels out!)
-xor_of_ciphers = xor_bytes(cipher_A, cipher_B)
-xor_of_plains  = xor_bytes(message_A, message_B)
+# ── ATTACK: XOR the two ciphertexts ──────────────────────────────────────────
+# ct1 XOR ct2 = (m1 XOR ks) XOR (m2 XOR ks) = m1 XOR m2  (keystream cancels!)
+# If an attacker knows or guesses part of m1, they can recover m2 (and vice versa).
+length = min(len(ct1), len(ct2))
+xored_ciphertexts = xor_bytes(ct1[:length], ct2[:length])
 
-print(f"\nC_A XOR C_B  : {xor_of_ciphers.hex()}")
-print(f"P_A XOR P_B  : {xor_of_plains.hex()}")
-print(f"They match   : {xor_of_ciphers == xor_of_plains}")
+# Attacker knows message1 (e.g., observed a known-plaintext or guessed the format)
+recovered_m2 = xor_bytes(xored_ciphertexts, message1[:length])
 
-# If attacker knows (or guesses) message_A, they recover message_B instantly:
-recovered_B = xor_bytes(xor_of_ciphers, message_A)
-print(f"\nAttacker recovers message B: {recovered_B}")
+print("\n[ATTACK]  Attacker XORs the two ciphertexts (key cancels out).")
+print(f"  Recovered message2: {recovered_m2.decode(errors='replace')!r}")
+print(f"  Actual   message2:  {message2[:length]!r}")
+print(f"  Attack succeeded:   {recovered_m2 == message2[:length]}")
 
-# ── Safe Demo ─────────────────────────────────────────────────────────────────
-print("\n" + "=" * 60)
-print("DEMO 2: Unique nonces – secure usage")
-print("=" * 60)
+# ── SECURE: unique random nonce per message ───────────────────────────────────
+nonce_a = os.urandom(16)   # fresh random nonce for every encryption
+nonce_b = os.urandom(16)   # different nonce — keystreams are completely unrelated
 
-# BEST PRACTICE: generate a fresh random nonce per message
-nonce_1 = os.urandom(12)   # 96-bit nonce, cryptographically random
-nonce_2 = os.urandom(12)   # Different nonce for every message
-
-safe_cipher_A = encrypt(message_A, SECRET_KEY, nonce_1)
-safe_cipher_B = encrypt(message_B, SECRET_KEY, nonce_2)
-
-xor_safe = xor_bytes(safe_cipher_A, safe_cipher_B)
-print(f"Safe C_A XOR C_
+ct_a = encrypt(message1, key, nonce_a
