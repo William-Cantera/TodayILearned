@@ -4,103 +4,103 @@ Date: 2026-11-15
 """
 
 # Optimistic vs Pessimistic Concurrency Locking Demo
-# =======================================================
-# Concurrency control strategies prevent data corruption when multiple
-# threads/processes access shared resources simultaneously.
+# =====================================================
+# Concurrency control prevents data corruption when multiple threads
+# access shared resources simultaneously.
 #
 # PESSIMISTIC LOCKING: Assumes conflicts WILL happen.
-#   - Acquires a lock BEFORE reading data, holds it until write completes.
-#   - Best for: high-contention environments, long transactions, write-heavy workloads.
-#   - Drawback: reduces throughput; threads block waiting for locks.
+#   - Locks the resource BEFORE reading/writing.
+#   - Other threads BLOCK until the lock is released.
+#   - Best for: High-contention environments, short transactions.
 #
 # OPTIMISTIC LOCKING: Assumes conflicts are RARE.
-#   - No lock on read; uses a version/timestamp to detect conflicts at write time.
-#   - Best for: low-contention environments, read-heavy workloads, short transactions.
-#   - Drawback: requires retry logic; wasteful if conflicts are frequent.
+#   - No lock on read; uses a VERSION NUMBER to detect conflicts.
+#   - On write, checks if version changed since last read.
+#   - If version mismatch → conflict detected → retry or abort.
+#   - Best for: Low-contention environments, long read operations.
 
 import threading
 import time
 import random
 
-# ---------------------------------------------------------------------------
-# Shared "database" record — a simple dict simulating a DB row
-# ---------------------------------------------------------------------------
-record = {"value": 100, "version": 0}
-record_lock = threading.Lock()  # Used only by pessimistic approach
+# ── Shared "database" record ──────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# PESSIMISTIC LOCKING IMPLEMENTATION
-# Best practice: keep the critical section as SHORT as possible.
-# ---------------------------------------------------------------------------
-def pessimistic_update(thread_id, amount):
-    """Acquire lock first, then read-modify-write. No conflict possible."""
-    print(f"[Pessimistic] Thread-{thread_id}: waiting for lock...")
-    with record_lock:                          # Block until lock is acquired
-        # Simulate some processing time inside the lock (keep this minimal!)
-        time.sleep(random.uniform(0.01, 0.05))
-        old_value = record["value"]
-        record["value"] += amount
-        record["version"] += 1
-        print(f"[Pessimistic] Thread-{thread_id}: "
-              f"{old_value} -> {record['value']} (v{record['version']})")
+class BankAccount:
+    """Simulates a database row with a version field for optimistic locking."""
+    def __init__(self, balance: int):
+        self.balance  = balance
+        self.version  = 0          # Incremented on every successful write
+        self._lock    = threading.Lock()   # Used only by pessimistic strategy
 
-# ---------------------------------------------------------------------------
-# OPTIMISTIC LOCKING IMPLEMENTATION
-# Best practice: retry on conflict; use exponential back-off in production.
-# ---------------------------------------------------------------------------
-def optimistic_update(thread_id, amount, max_retries=5):
-    """Read freely, then validate version before committing the write."""
-    for attempt in range(1, max_retries + 1):
-        # --- READ PHASE (no lock) ---
-        snapshot_value   = record["value"]     # Read current value
-        snapshot_version = record["version"]   # Remember the version we saw
+# ── PESSIMISTIC LOCKING ───────────────────────────────────────────────────────
 
-        # Simulate processing / business logic outside any lock
-        time.sleep(random.uniform(0.01, 0.05))
-        new_value = snapshot_value + amount
+def pessimistic_deposit(account: BankAccount, amount: int, thread_name: str):
+    """
+    Acquire the lock FIRST, then read-modify-write.
+    Guarantees no other thread can interfere during the entire operation.
+    Downside: threads queue up, reducing throughput under heavy load.
+    """
+    with account._lock:                      # Block until lock is acquired
+        old_balance = account.balance
+        time.sleep(random.uniform(0, 0.02))  # Simulate processing delay
+        account.balance += amount
+        account.version += 1
+        print(f"  [PESSIMISTIC] {thread_name}: "
+              f"{old_balance} → {account.balance}  (v{account.version})")
 
-        # --- WRITE PHASE (short lock only to check-and-set) ---
-        with record_lock:
-            if record["version"] == snapshot_version:   # No one changed it?
-                record["value"]   = new_value           # Safe to commit
-                record["version"] += 1
-                print(f"[Optimistic]  Thread-{thread_id}: attempt {attempt} "
-                      f"SUCCESS  {snapshot_value} -> {record['value']} "
-                      f"(v{record['version']})")
-                return  # Done — exit retry loop
-            else:
-                # Another thread changed the record; our snapshot is stale
-                print(f"[Optimistic]  Thread-{thread_id}: attempt {attempt} "
-                      f"CONFLICT — retrying...")
+# ── OPTIMISTIC LOCKING ────────────────────────────────────────────────────────
 
-    print(f"[Optimistic]  Thread-{thread_id}: gave up after {max_retries} retries!")
+def optimistic_deposit(account: BankAccount, amount: int, thread_name: str):
+    """
+    Read WITHOUT locking, then attempt a conditional write.
+    If the version changed between read and write → conflict → retry.
+    Downside: wasted work on conflict; bad under heavy contention.
+    """
+    retries = 0
+    while True:
+        # 1. Snapshot the current state (no lock needed for the read)
+        read_version = account.version
+        old_balance  = account.balance
+        new_balance  = old_balance + amount
 
-# ---------------------------------------------------------------------------
-# DEMO: run both strategies sequentially so output is readable
-# ---------------------------------------------------------------------------
-def run_demo(strategy_fn, label, num_threads=4):
-    global record
-    record = {"value": 100, "version": 0}      # Reset shared state
-    print(f"\n{'='*55}")
-    print(f"  {label}  (starting value = {record['value']})")
-    print(f"{'='*55}")
+        time.sleep(random.uniform(0, 0.02))  # Simulate processing delay
+
+        # 2. Commit phase: use a brief lock ONLY to check-and-swap atomically
+        with account._lock:
+            if account.version == read_version:      # No conflict → commit
+                account.balance = new_balance
+                account.version += 1
+                print(f"  [OPTIMISTIC]  {thread_name}: "
+                      f"{old_balance} → {account.balance}  "
+                      f"(v{account.version}, retries={retries})")
+                return
+            else:                                    # Conflict → retry
+                retries += 1
+                print(f"  [OPTIMISTIC]  {thread_name}: "
+                      f"CONFLICT (expected v{read_version}, "
+                      f"found v{account.version}) — retrying…")
+
+# ── RUNNER ────────────────────────────────────────────────────────────────────
+
+def run_demo(strategy_fn, label: str):
+    account   = BankAccount(balance=1000)
+    expected  = account.balance + 5 * 100   # 5 threads each deposit 100
+    print(f"\n{'─'*55}\n{label}\nStarting balance: {account.balance}\n{'─'*55}")
 
     threads = [
-        threading.Thread(target=strategy_fn, args=(i, random.choice([-10, 10, 20])))
-        for i in range(1, num_threads + 1)
+        threading.Thread(target=strategy_fn,
+                         args=(account, 100, f"Thread-{i+1}"))
+        for i in range(5)
     ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    for t in threads: t.start()
+    for t in threads: t.join()
 
-    print(f"\n  Final record: value={record['value']}, version={record['version']}")
+    status = "✓ CORRECT" if account.balance == expected else "✗ WRONG"
+    print(f"{'─'*55}")
+    print(f"Final balance : {account.balance}  (expected {expected})  {status}")
+
+# ── ENTRY POINT ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    random.seed(42)
-    run_demo(pessimistic_update, "PESSIMISTIC LOCKING")
-    run_demo(optimistic_update,  "OPTIMISTIC LOCKING")
-
-    print("\n--- Key Takeaways ---")
-    print("Pessimistic: zero retries, but threads queue up  → use for high contention.")
-    print("Optimistic :
+    # Best practice: choose the strategy based on your contention profile.
+    # Both strategies below should yield the correct final balance (1500
