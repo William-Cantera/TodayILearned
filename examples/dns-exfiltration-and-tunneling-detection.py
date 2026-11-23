@@ -1,70 +1,100 @@
 """
 Today I Learned Example: DNS Exfiltration and Tunneling Detection
-Date: 2026-11-09
+Date: 2026-11-22
 """
 
 # DNS Exfiltration and Tunneling Detection
-# This script demonstrates how to detect DNS-based data exfiltration and tunneling
-# by analyzing DNS query patterns. Attackers often encode stolen data in DNS queries
-# (subdomains) or use DNS as a covert communication channel to bypass firewalls.
+# This script demonstrates how to detect potential DNS-based data exfiltration
+# and tunneling attacks by analyzing DNS query patterns and characteristics.
 #
-# When to use: Network security monitoring, incident response, SOC analysis
-# Best practices: Combine with threat intel feeds, baseline normal DNS traffic first,
-# tune thresholds per environment, alert on anomalies rather than block blindly
+# DNS tunneling works by encoding data into DNS queries/responses, allowing
+# attackers to bypass firewalls and exfiltrate data covertly.
+#
+# When to use: Network security monitoring, SOC analysis, IDS/IPS rule development
+# Best practices: Combine multiple detection signals, maintain baseline thresholds,
+#                 correlate with other network telemetry for fewer false positives
 
 import re
 import math
-import hashlib
-from collections import defaultdict, Counter
-from datetime import datetime
+import collections
+from datetime import datetime, timedelta
+import random
+import string
 
-# --- Simulated DNS query log (in production, parse real DNS logs or pcap data) ---
-# Format: (timestamp, source_ip, queried_domain)
-DNS_QUERIES = [
-    ("2024-01-15 10:00:01", "192.168.1.10", "google.com"),
-    ("2024-01-15 10:00:02", "192.168.1.10", "github.com"),
-    ("2024-01-15 10:00:03", "192.168.1.55", "aGVsbG8td29ybGQ.evil.com"),       # base64-like
-    ("2024-01-15 10:00:04", "192.168.1.55", "dGhpcyBpcyBzZWNyZXQ.evil.com"),   # base64-like
-    ("2024-01-15 10:00:05", "192.168.1.55", "c2Vuc2l0aXZlZGF0YQ.evil.com"),    # base64-like
-    ("2024-01-15 10:00:06", "192.168.1.20", "normal-site.org"),
-    ("2024-01-15 10:00:07", "192.168.1.33", "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4.tunnel.net"),  # hex-like
-    ("2024-01-15 10:00:08", "192.168.1.33", "deadbeefcafebabe0123456789abcdef.tunnel.net"),  # hex-like
-    ("2024-01-15 10:00:09", "192.168.1.33", "0011223344556677889900aabbccddee.tunnel.net"),  # hex-like
-    ("2024-01-15 10:00:10", "192.168.1.10", "stackoverflow.com"),
-    ("2024-01-15 10:00:11", "192.168.1.77", "xn--nxasmq6b.xn--nxasmq6b.xn--nxasmq6b.weird.io"),  # punycode abuse
-    ("2024-01-15 10:00:12", "192.168.1.55", "ZmluYWxjaHVuaw.evil.com"),         # base64-like
-    ("2024-01-15 10:00:13", "192.168.1.33", "ffee1122334455667788990011223344.tunnel.net"),
-]
+# --- Entropy Calculation ---
+# High entropy in subdomains indicates encoded/encrypted data (base64, hex, etc.)
+# Legitimate domains like "www.google.com" have low entropy; tunneled data is random-looking
 
-def calculate_entropy(data: str) -> float:
-    """
-    Shannon entropy measures randomness in a string.
-    High entropy (>3.5) in subdomains suggests encoded/encrypted data.
-    Legitimate domains have low entropy; tunneled data has high entropy.
-    """
-    if not data:
+def calculate_entropy(text):
+    """Shannon entropy measures randomness. Values > 3.5 suggest encoded payloads."""
+    if not text:
         return 0.0
-    freq = Counter(data)
-    length = len(data)
+    freq = collections.Counter(text.lower())
+    length = len(text)
     return -sum((count / length) * math.log2(count / length) for count in freq.values())
 
-def extract_subdomain(domain: str) -> str:
-    """Extract the leftmost subdomain label for analysis."""
-    parts = domain.split(".")
-    return parts[0] if len(parts) > 2 else ""
+# --- Subdomain Length Check ---
+# Legitimate subdomains are typically short (www, mail, api).
+# DNS tunneling tools encode chunks of data, producing unusually long subdomains.
 
-def detect_encoding(subdomain: str) -> list:
-    """
-    Detect common encoding schemes used in DNS exfiltration:
-    - Base64: alphanumeric + /+=, length multiple of 4
-    - Hex: only 0-9a-f characters, even length
-    """
-    indicators = []
-    if re.match(r'^[A-Za-z0-9+/=\-_]+$', subdomain) and len(subdomain) > 20:
-        # Base64url is common in DNS tunneling (replaces + with - and / with _)
-        indicators.append("possible_base64_encoding")
-    if re.match(r'^[0-9a-fA-F]+$', subdomain) and len(subdomain) >= 16:
-        indicators.append("possible_hex_encoding")
-    return indicators
+def check_subdomain_length(domain, threshold=40):
+    """Flag subdomains exceeding typical length. Tunneling tools often use 50-63 char subdomains."""
+    parts = domain.split('.')
+    subdomain = '.'.join(parts[:-2]) if len(parts) > 2 else ''
+    return len(subdomain) > threshold, len(subdomain), subdomain
 
-def analyze_dns_logs(queries: list) -> dict:
+# --- Query Frequency Analysis ---
+# Tunneling generates high-frequency queries to the same domain (acting as a channel).
+# Normal users rarely query the same TLD hundreds of times per minute.
+
+def analyze_query_frequency(query_log, time_window_seconds=60, threshold=50):
+    """Detect domains queried suspiciously often within a time window."""
+    domain_counts = collections.Counter()
+    cutoff = datetime.now() - timedelta(seconds=time_window_seconds)
+    for timestamp, domain in query_log:
+        if timestamp >= cutoff:
+            # Extract base domain (last two parts) to group subdomains together
+            parts = domain.split('.')
+            base = '.'.join(parts[-2:]) if len(parts) >= 2 else domain
+            domain_counts[base] += 1
+    return {d: c for d, c in domain_counts.items() if c >= threshold}
+
+# --- Unique Subdomain Detection ---
+# Tunneling generates many unique subdomains per base domain (each query = new data chunk).
+# Legitimate services reuse a small set of subdomains consistently.
+
+def detect_unique_subdomains(query_log, threshold=20):
+    """Flag base domains with too many unique subdomains — classic tunneling indicator."""
+    subdomain_map = collections.defaultdict(set)
+    for _, domain in query_log:
+        parts = domain.split('.')
+        if len(parts) > 2:
+            base = '.'.join(parts[-2:])
+            subdomain_map[base].add('.'.join(parts[:-2]))
+    return {d: len(subs) for d, subs in subdomain_map.items() if len(subs) >= threshold}
+
+# --- Simulate DNS Query Log ---
+# Generates realistic benign traffic mixed with simulated tunneling activity
+
+def generate_simulated_log():
+    now = datetime.now()
+    log = []
+    # Benign traffic: normal browsing patterns
+    benign = ['www.google.com', 'mail.yahoo.com', 'api.github.com', 'cdn.cloudflare.com']
+    for domain in benign:
+        for _ in range(random.randint(3, 8)):
+            log.append((now - timedelta(seconds=random.randint(0, 59)), domain))
+    # Malicious traffic: simulate iodine/dnscat-style tunneling to evil.com
+    for _ in range(60):
+        # Random high-entropy subdomain simulating base32-encoded payload chunks
+        chunk = ''.join(random.choices(string.ascii_lowercase + string.digits, k=random.randint(45, 60)))
+        log.append((now - timedelta(seconds=random.randint(0, 59)), f"{chunk}.evil.com"))
+    return log
+
+# --- Main Detection Engine ---
+if __name__ == '__main__':
+    print("=== DNS Exfiltration & Tunneling Detector ===\n")
+    log = generate_simulated_log()
+
+    # Check 1: Entropy and length analysis per query
+    print("[*] Analyzing individual queries for high-entropy
